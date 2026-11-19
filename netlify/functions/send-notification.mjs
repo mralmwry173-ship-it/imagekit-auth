@@ -318,7 +318,10 @@ async function sendToFcm(token, title, body, data) {
           token,
           notification: { title, body },
           data,
-          android: { priority: 'HIGH' },
+          android: {
+            priority: 'HIGH',
+            notification: { channel_id: 'matjar_default_channel' },
+          },
         },
       }),
     },
