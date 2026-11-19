@@ -104,6 +104,7 @@ function decodeFirestoreFields(fields = {}) {
 function encodeFirestoreValue(value, depth = 0) {
   if (depth > 12) return { stringValue: '[maximum depth]' };
   if (value === null || value === undefined) return { nullValue: 'NULL_VALUE' };
+  if (value instanceof Date) return { timestampValue: value.toISOString() };
   if (typeof value === 'string') return { stringValue: value.slice(0, 4000) };
   if (typeof value === 'boolean') return { booleanValue: value };
   if (typeof value === 'number') {
@@ -486,7 +487,7 @@ export const handler = async (event) => {
       type,
       data: notificationData,
       isRead: false,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(),
     });
 
     if (writeResult.duplicate) {
