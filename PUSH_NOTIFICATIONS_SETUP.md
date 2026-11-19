@@ -46,6 +46,9 @@ The service account must have permission to read/write the Firestore database an
 
 Keep `IMAGEKIT_PRIVATE_KEY`, `FIREBASE_WEB_API_KEY`, and any existing ImageKit-related variables exactly as they are. Do not replace or remove `ALLOWED_ORIGIN`; native mobile requests normally have no Origin header, while web requests are checked against the configured origin.
 
+## Flutter tap-route requirement
+The inspected app router nests the notification screen under the customer and merchant dashboards, while the supplied FCM service defaults taps to `/notifications`. A general root route `/notifications` must be added to the Flutter router (using the existing `NotificationsScreen`) so customer, merchant, delivery, and staff accounts can all open the same notification list. Do not assume the nested customer/merchant route works for delivery agents.
+
 ## Deliberate limits
 - This first version handles order-status notifications only. Complaint notification authorization is not implemented because the complaint schema and participant rules have not yet been verified.
 - If `data.orderId` or a supported status is missing, the endpoint rejects the request. The current Flutter service then attempts its existing Firestore fallback.
