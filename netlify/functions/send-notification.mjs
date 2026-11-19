@@ -23,6 +23,8 @@ const STATUS_LABELS = {
   completed: 'اكتمل الطلب',
   cancelled: 'تم إلغاء الطلب',
   rejected: 'تم رفض الطلب',
+  failed_delivery: 'تعذّر توصيل الطلب',
+  returned: 'تم إرجاع الطلب',
 };
 
 const MERCHANT_STATUSES = new Set([
@@ -39,12 +41,16 @@ const AGENT_STATUSES = new Set([
   'on_the_way',
   'delivering',
   'delivered',
+  'failed_delivery',
 ]);
 const CUSTOMER_STATUSES = new Set([
   'pending',
   'payment_pending',
+]);
+const PARTICIPANT_STATUSES = new Set([
   'cancelled',
   'completed',
+  'returned',
 ]);
 
 let serviceAccountCache;
@@ -460,9 +466,42 @@ export const handler = async (event) => {
     if (!isAdmin && CUSTOMER_STATUSES.has(newStatus) && !isCustomer) {
       return response(403, { error: 'Only the customer or an administrator can notify this status' }, headers);
     }
+    if (
+      !isAdmin &&
+      PARTICIPANT_STATUSES.has(newStatus) &&
+      !(isCustomer || isMerchant || isAgent)
+    ) {
+      return response(403, { error: 'An order participant or administrator is required for this status' }, headers);
+    }
 
-    if (recipientUid === senderUid || !participants.includes(recipientUid)) {
-      return response(403, { error: 'Recipient is not another participant in this order' }, headers);
+    // OrderNotifier intentionally targets the current user for some events
+    // (for example: the customer notification for their own pending order).
+    // Accept that request as a no-op instead of creating a duplicate fallback.
+    if (recipientUid === senderUid) {
+      return response(200, { success: true, skipped: true, reason: 'Sender does not receive their own notification' }, headers);
+    }
+
+    const isAvailableAgentBroadcast =
+      data.for === 'agent' && newStatus === 'ready_for_pickup';
+
+    let isEligibleBroadcastAgent = false;
+    if (!participants.includes(recipientUid) && isAvailableAgentBroadcast) {
+      const agentProfile = await getFirestoreDocument(
+        'delivery_agents/' + encodeURIComponent(recipientUid),
+      );
+      if (
+        !agentProfile ||
+        agentProfile.isAvailable !== true ||
+        agentProfile.approvalStatus !== 'approved' ||
+        agentProfile.isActive === false
+      ) {
+        return response(403, { error: 'Recipient is not an approved, available delivery agent' }, headers);
+      }
+      isEligibleBroadcastAgent = true;
+    }
+
+    if (!participants.includes(recipientUid) && !isEligibleBroadcastAgent) {
+      return response(403, { error: 'Recipient is not an order participant or eligible available agent' }, headers);
     }
 
     const recipientUser = await getFirestoreDocument(
@@ -470,6 +509,12 @@ export const handler = async (event) => {
     );
     if (!recipientUser) {
       return response(404, { error: 'Recipient account not found' }, headers);
+    }
+    if (
+      isEligibleBroadcastAgent &&
+      String(recipientUser.role || '').toLowerCase() !== 'delivery_agent'
+    ) {
+      return response(403, { error: 'Broadcast recipient is not a delivery-agent account' }, headers);
     }
 
     const notificationData = {
@@ -509,7 +554,15 @@ export const handler = async (event) => {
 
     const fcmData = toFcmData(notificationData, notificationId, orderId, newStatus);
     const results = await Promise.all(
-      tokens.map((token) => sendToFcm(token, title, body, fcmData)),
+      tokens.map(async (token) => {
+        try {
+          return await sendToFcm(token, title, body, fcmData);
+        } catch {
+          // The notification document is already saved. Keep one failed
+          // device send from turning the whole request into a 500 response.
+          return { ok: false, status: 0, error: 'FCM request failed' };
+        }
+      }),
     );
     const sent = results.filter((item) => item.ok).length;
     const failed = results.length - sent;
