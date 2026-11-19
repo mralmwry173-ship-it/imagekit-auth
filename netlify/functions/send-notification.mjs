@@ -7,7 +7,7 @@ const FIREBASE_JWKS = createRemoteJWKSet(
   new URL('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'),
 );
 
-const ORDER_STATUS_LABELS = {
+const STATUS_LABELS = {
   pending: 'قيد الانتظار',
   payment_pending: 'بانتظار تأكيد الدفع',
   paid: 'تم تأكيد الدفع',
@@ -26,13 +26,25 @@ const ORDER_STATUS_LABELS = {
 };
 
 const MERCHANT_STATUSES = new Set([
-  'paid', 'confirmed', 'preparing', 'ready_for_pickup', 'delivery_searching', 'rejected',
+  'paid',
+  'confirmed',
+  'preparing',
+  'ready_for_pickup',
+  'delivery_searching',
+  'rejected',
 ]);
 const AGENT_STATUSES = new Set([
-  'assigned_to_agent', 'picked_up', 'on_the_way', 'delivering', 'delivered',
+  'assigned_to_agent',
+  'picked_up',
+  'on_the_way',
+  'delivering',
+  'delivered',
 ]);
-const PARTICIPANT_STATUSES = new Set([
-  'pending', 'payment_pending', 'completed', 'cancelled',
+const CUSTOMER_STATUSES = new Set([
+  'pending',
+  'payment_pending',
+  'cancelled',
+  'completed',
 ]);
 
 let serviceAccountCache;
@@ -54,6 +66,7 @@ function corsHeaders(event) {
   const origin = event.headers?.origin || event.headers?.Origin || '';
   const allowedOrigin = process.env.ALLOWED_ORIGIN || '';
 
+  // Native Android/iOS requests normally have no Origin header.
   if (!origin) return {};
   if (!allowedOrigin || origin !== allowedOrigin) return null;
 
@@ -85,6 +98,44 @@ function decodeFirestoreValue(value) {
 function decodeFirestoreFields(fields = {}) {
   return Object.fromEntries(
     Object.entries(fields).map(([key, value]) => [key, decodeFirestoreValue(value)]),
+  );
+}
+
+function encodeFirestoreValue(value, depth = 0) {
+  if (depth > 12) return { stringValue: '[maximum depth]' };
+  if (value === null || value === undefined) return { nullValue: 'NULL_VALUE' };
+  if (typeof value === 'string') return { stringValue: value.slice(0, 4000) };
+  if (typeof value === 'boolean') return { booleanValue: value };
+  if (typeof value === 'number') {
+    return Number.isInteger(value)
+      ? { integerValue: String(value) }
+      : { doubleValue: value };
+  }
+  if (Array.isArray(value)) {
+    return {
+      arrayValue: {
+        values: value.slice(0, 100).map((item) => encodeFirestoreValue(item, depth + 1)),
+      },
+    };
+  }
+  if (typeof value === 'object') {
+    return {
+      mapValue: {
+        fields: Object.fromEntries(
+          Object.entries(value)
+            .filter(([key]) => key.length > 0 && key.length <= 150)
+            .slice(0, 100)
+            .map(([key, item]) => [key, encodeFirestoreValue(item, depth + 1)]),
+        ),
+      },
+    };
+  }
+  return { stringValue: String(value).slice(0, 4000) };
+}
+
+function encodeFirestoreFields(fields) {
+  return Object.fromEntries(
+    Object.entries(fields).map(([key, value]) => [key, encodeFirestoreValue(value)]),
   );
 }
 
@@ -166,7 +217,8 @@ async function getGoogleAccessToken() {
 
 async function getFirestoreDocument(path) {
   const token = await getGoogleAccessToken();
-  const url = 'https://firestore.googleapis.com/v1/projects/' + PROJECT_ID + '/databases/(default)/documents/' + path;
+  const url = 'https://firestore.googleapis.com/v1/projects/' + PROJECT_ID +
+    '/databases/(default)/documents/' + path;
   const result = await fetch(url, {
     headers: { Authorization: 'Bearer ' + token },
   });
@@ -176,6 +228,28 @@ async function getFirestoreDocument(path) {
 
   const document = await result.json();
   return decodeFirestoreFields(document.fields || {});
+}
+
+async function createNotificationDocument(notificationId, fields) {
+  const accessToken = await getGoogleAccessToken();
+  const url = 'https://firestore.googleapis.com/v1/projects/' + PROJECT_ID +
+    '/databases/(default)/documents/notifications?documentId=' +
+    encodeURIComponent(notificationId);
+
+  const result = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + accessToken,
+      'Content-Type': 'application/json; charset=utf-8',
+    },
+    body: JSON.stringify({ fields: encodeFirestoreFields(fields) }),
+  });
+
+  if (result.status === 409) return { created: false, duplicate: true };
+  if (!result.ok) {
+    throw new Error('Firestore notification write failed (' + result.status + ')');
+  }
+  return { created: true, duplicate: false };
 }
 
 function extractFcmTokens(user) {
@@ -193,8 +267,39 @@ function extractFcmTokens(user) {
       .map(([token]) => token);
   }
 
-  return [...new Set(tokens.filter((token) => typeof token === 'string' && token.length > 20))]
-    .slice(0, 20);
+  return [...new Set(tokens.filter(
+    (token) => typeof token === 'string' && token.length > 20,
+  ))].slice(0, 20);
+}
+
+function toFcmData(data, notificationId, orderId, status) {
+  const result = {
+    notificationId,
+    type: 'order_status',
+    orderId,
+    status,
+    route: typeof data.route === 'string' && data.route.startsWith('/')
+      ? data.route
+      : '/notifications',
+  };
+
+  for (const [key, value] of Object.entries(data)) {
+    if (
+      /^[A-Za-z0-9_-]{1,40}$/.test(key) &&
+      value !== null &&
+      value !== undefined &&
+      ['string', 'number', 'boolean'].includes(typeof value)
+    ) {
+      result[key] = String(value).slice(0, 500);
+    }
+  }
+
+  // Keep these trusted routing/status values authoritative.
+  result.notificationId = notificationId;
+  result.type = 'order_status';
+  result.orderId = orderId;
+  result.status = status;
+  return result;
 }
 
 async function sendToFcm(token, title, body, data) {
@@ -227,6 +332,10 @@ async function sendToFcm(token, title, body, data) {
 
 function safeId(value) {
   return typeof value === 'string' && /^[A-Za-z0-9_-]{1,150}$/.test(value);
+}
+
+function safeText(value, maxLength) {
+  return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
 }
 
 export const handler = async (event) => {
@@ -264,16 +373,29 @@ export const handler = async (event) => {
       return response(400, { error: 'Invalid JSON body' }, headers);
     }
 
-    const payload = requestBody?.event && typeof requestBody.event === 'object'
-      ? requestBody.event
-      : requestBody?.data && typeof requestBody.data === 'object'
-        ? requestBody.data
-        : requestBody;
+    const notificationId = requestBody?.notificationId;
+    const recipientUid = requestBody?.recipientUid;
+    const title = safeText(requestBody?.title, 120);
+    const body = safeText(requestBody?.body, 400);
+    const type = safeText(requestBody?.type || 'system', 40);
+    const data = requestBody?.data && typeof requestBody.data === 'object' &&
+      !Array.isArray(requestBody.data)
+      ? requestBody.data
+      : {};
 
-    const orderId = payload?.orderId;
-    const newStatus = payload?.newStatus || payload?.new_status || payload?.status;
-    if (!safeId(orderId) || typeof newStatus !== 'string' || !Object.hasOwn(ORDER_STATUS_LABELS, newStatus)) {
-      return response(400, { error: 'An orderId and a supported newStatus are required' }, headers);
+    // The Flutter NotificationService sends notificationId/recipientUid/title/body/type/data.
+    // Order context must be inside data; the target is never trusted without checking Firestore.
+    const orderId = data.orderId || data.order_id;
+    const newStatus = data.newStatus || data.new_status || data.status || data.toStatus || data.to_status;
+
+    if (!safeId(notificationId) || !safeId(recipientUid) || !title || !body) {
+      return response(400, { error: 'notificationId, recipientUid, title and body are required' }, headers);
+    }
+    if (type.length === 0 || !safeId(orderId) || typeof newStatus !== 'string' ||
+        !Object.hasOwn(STATUS_LABELS, newStatus)) {
+      return response(400, {
+        error: 'This endpoint currently accepts order notifications with data.orderId and data.newStatus',
+      }, headers);
     }
 
     const { payload: identity } = await jwtVerify(match[1], FIREBASE_JWKS, {
@@ -299,7 +421,6 @@ export const handler = async (event) => {
     if (['disabled', 'suspended', 'blocked', 'deleted'].includes(accountStatus)) {
       return response(403, { error: 'User account is not active' }, headers);
     }
-
     if (order.status !== newStatus) {
       return response(409, { error: 'The order status does not match this notification' }, headers);
     }
@@ -315,8 +436,7 @@ export const handler = async (event) => {
     }
 
     const participants = [...new Set(
-      [customerUid, assignedAgentUid, storeOwnerUid]
-        .filter((uid) => safeId(uid)),
+      [customerUid, assignedAgentUid, storeOwnerUid].filter((uid) => safeId(uid)),
     )];
     const role = String(sender.role || identity.role || '').toLowerCase();
     const isAdmin = ['admin_staff', 'super_admin'].includes(role);
@@ -333,74 +453,81 @@ export const handler = async (event) => {
     if (!isAdmin && AGENT_STATUSES.has(newStatus) && !isAgent) {
       return response(403, { error: 'Only the assigned delivery agent or an administrator can notify this status' }, headers);
     }
-    if (!isAdmin && PARTICIPANT_STATUSES.has(newStatus) && !(isCustomer || isMerchant || isAgent)) {
-      return response(403, { error: 'Order participant required' }, headers);
+    if (!isAdmin && CUSTOMER_STATUSES.has(newStatus) && !isCustomer) {
+      return response(403, { error: 'Only the customer or an administrator can notify this status' }, headers);
     }
 
-    let recipientUids = participants.filter((uid) => uid !== senderUid);
-    const requestedRecipient = payload.recipientUid || payload.targetUid || requestBody?.recipientUid || requestBody?.targetUid;
-    if (requestedRecipient !== undefined) {
-      if (!safeId(requestedRecipient) || !recipientUids.includes(requestedRecipient)) {
-        return response(403, { error: 'Recipient is not a participant in this order' }, headers);
-      }
-      recipientUids = [requestedRecipient];
-    }
-    const requestedUids = payload.recipientUids || requestBody?.recipientUids;
-    if (Array.isArray(requestedUids)) {
-      const requested = [...new Set(requestedUids)];
-      if (
-        requested.length === 0 ||
-        requested.some((uid) => !safeId(uid) || !recipientUids.includes(uid))
-      ) {
-        return response(403, { error: 'One or more recipients are not participants in this order' }, headers);
-      }
-      recipientUids = requested;
+    if (recipientUid === senderUid || !participants.includes(recipientUid)) {
+      return response(403, { error: 'Recipient is not another participant in this order' }, headers);
     }
 
-    if (recipientUids.length === 0) {
-      return response(200, { success: true, sent: 0, reason: 'No other order participants' }, headers);
-    }
-
-    const recipientUsers = await Promise.all(
-      recipientUids.map(async (uid) => ({ uid, user: await getFirestoreDocument('users/' + encodeURIComponent(uid)) })),
+    const recipientUser = await getFirestoreDocument(
+      'users/' + encodeURIComponent(recipientUid),
     );
-    const tokenTargets = recipientUsers.flatMap(({ uid, user }) =>
-      extractFcmTokens(user).map((token) => ({ uid, token })),
-    );
-
-    if (tokenTargets.length === 0) {
-      return response(200, { success: true, sent: 0, reason: 'No registered notification tokens' }, headers);
+    if (!recipientUser) {
+      return response(404, { error: 'Recipient account not found' }, headers);
     }
 
-    const title = 'تحديث الطلب ' + orderId;
-    const body = 'حالة طلبك الآن: ' + ORDER_STATUS_LABELS[newStatus];
-    const data = {
-      type: 'order_status',
+    const notificationData = {
+      ...data,
       orderId,
       status: newStatus,
-      route: '/notifications',
+      route: typeof data.route === 'string' && data.route.startsWith('/')
+        ? data.route
+        : '/notifications',
     };
 
-    const results = await Promise.all(
-      tokenTargets.map(({ token }) => sendToFcm(token, title, body, data)),
-    );
-    const sent = results.filter((result) => result.ok).length;
-    const failed = results.length - sent;
+    // Store the in-app notification first; the Flutter screen reads this collection.
+    const writeResult = await createNotificationDocument(notificationId, {
+      recipientUid,
+      senderUid,
+      title,
+      body,
+      type,
+      data: notificationData,
+      isRead: false,
+      createdAt: new Date().toISOString(),
+    });
 
-    if (sent === 0 && failed > 0) {
-      console.error('FCM send failed for all targeted device tokens.');
-      return response(502, { success: false, sent, failed }, headers);
+    if (writeResult.duplicate) {
+      return response(200, { success: true, duplicate: true, sent: 0 }, headers);
     }
 
+    const tokens = extractFcmTokens(recipientUser);
+    if (tokens.length === 0) {
+      return response(200, {
+        success: true,
+        stored: true,
+        sent: 0,
+        reason: 'No registered FCM tokens for recipient',
+      }, headers);
+    }
+
+    const fcmData = toFcmData(notificationData, notificationId, orderId, newStatus);
+    const results = await Promise.all(
+      tokens.map((token) => sendToFcm(token, title, body, fcmData)),
+    );
+    const sent = results.filter((item) => item.ok).length;
+    const failed = results.length - sent;
+
+    if (failed > 0) {
+      console.error('FCM send failures:', failed, 'of', results.length);
+    }
+
+    // The in-app notification is already stored; return success to avoid the
+    // mobile client writing a duplicate fallback record.
     return response(200, {
       success: true,
+      stored: true,
       sent,
       failed,
-      recipientCount: recipientUids.length,
     }, headers);
   } catch (error) {
-    // Avoid logging credentials, tokens, request bodies, or private-key material.
-    console.error('Notification function failed:', error instanceof Error ? error.message : 'unknown error');
+    // Do not log secrets, service-account keys, ID tokens, or request bodies.
+    console.error(
+      'Notification function failed:',
+      error instanceof Error ? error.message : 'unknown error',
+    );
     return response(500, { error: 'Notification service temporarily unavailable' }, headers);
   }
 };
