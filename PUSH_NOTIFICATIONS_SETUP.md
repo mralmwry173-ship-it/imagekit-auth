@@ -53,6 +53,7 @@ The inspected app router nests the notification screen under the customer and me
 - This first version handles order-status notifications only. Complaint notification authorization is not implemented because the complaint schema and participant rules have not yet been verified.
 - If `data.orderId` or a supported status is missing, the endpoint rejects the request. The current Flutter service then attempts its existing Firestore fallback.
 - The function stores the in-app notification before attempting FCM, so notification history remains available even when a device has no registered token or FCM is temporarily unavailable.
+- Per-device FCM request failures are isolated; one failed device does not turn a successfully stored notification into a 500 response.
 - Stale-token cleanup and delivery analytics are not included in this first version.
 
 ## Deploy Preview and test
