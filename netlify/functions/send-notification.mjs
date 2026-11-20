@@ -10,6 +10,8 @@ const FIREBASE_JWKS = createRemoteJWKSet(
 const STATUS_LABELS = {
   pending: 'قيد الانتظار',
   payment_pending: 'بانتظار تأكيد الدفع',
+  awaiting_payment_confirmation: 'بيانات الدفع بانتظار المراجعة',
+  payment_rejected: 'تم رفض الدفع',
   paid: 'تم تأكيد الدفع',
   confirmed: 'تم تأكيد الطلب',
   preparing: 'جارٍ تجهيز الطلب',
@@ -50,6 +52,7 @@ const AGENT_STATUSES = new Set([
 const CUSTOMER_STATUSES = new Set([
   'pending',
   'payment_pending',
+  'awaiting_payment_confirmation',
 ]);
 const PARTICIPANT_STATUSES = new Set([
   'cancelled',
@@ -688,6 +691,10 @@ export const handler = async (event) => {
       if (!complaint) return response(404, { error: 'Complaint not found' }, headers);
       if (!sender) return response(403, { error: 'User account not found' }, headers);
 
+      const senderAccountStatus = safeText(sender.status, 32).toLowerCase();
+      if (['disabled', 'suspended', 'blocked', 'deleted'].includes(senderAccountStatus)) {
+        return response(403, { error: 'User account is not active' }, headers);
+      }
       const senderRole = safeText(sender.role || identity.role || '', 64).toLowerCase();
       const complainantUid = safeText(complaint.complainantUid, 128);
       let allowed = false;
@@ -781,6 +788,17 @@ export const handler = async (event) => {
     const isMerchant = senderUid === storeOwnerUid;
     const isAgent = senderUid === assignedAgentUid;
 
+    if (newStatus === 'awaiting_payment_confirmation' &&
+        (!isCustomer || recipientUid !== storeOwnerUid)) {
+      return response(403, {
+        error: 'Payment-submission notifications may only be sent by the customer to the store owner',
+      }, headers);
+    }
+    if (newStatus === 'payment_rejected' && !isAdmin) {
+      return response(403, {
+        error: 'Only an administrator may send payment-rejection notifications',
+      }, headers);
+    }
     if (!isAdmin && !participants.includes(senderUid)) {
       return response(403, { error: 'You are not a participant in this order' }, headers);
     }
