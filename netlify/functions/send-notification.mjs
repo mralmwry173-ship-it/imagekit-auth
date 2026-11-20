@@ -335,7 +335,34 @@ async function sendToFcm(token, title, body, data) {
 
   if (!result.ok) {
     const errorBody = await result.text().catch(() => '');
-    return { ok: false, status: result.status, error: errorBody.slice(0, 500) };
+    let payload = {};
+    try {
+      payload = JSON.parse(errorBody);
+    } catch {
+      // Some upstream failures may not return JSON.
+    }
+
+    const apiError = payload?.error ?? {};
+    const details = Array.isArray(apiError.details) ? apiError.details : [];
+    const fcmDetail = details.find((item) =>
+      typeof item?.errorCode === 'string' ||
+      (typeof item?.['@type'] === 'string' &&
+        item['@type'].includes('google.firebase.fcm.v1.FcmError')),
+    );
+
+    return {
+      ok: false,
+      status: result.status,
+      errorStatus: typeof apiError.status === 'string'
+        ? apiError.status.slice(0, 80)
+        : 'UNKNOWN',
+      errorCode: typeof fcmDetail?.errorCode === 'string'
+        ? fcmDetail.errorCode.slice(0, 80)
+        : '',
+      errorMessage: typeof apiError.message === 'string'
+        ? apiError.message.replace(/\\s+/g, ' ').slice(0, 180)
+        : 'FCM request rejected',
+    };
   }
   return { ok: true };
 }
@@ -554,13 +581,22 @@ export const handler = async (event) => {
 
     const fcmData = toFcmData(notificationData, notificationId, orderId, newStatus);
     const results = await Promise.all(
-      tokens.map(async (token) => {
+      tokens.map(async (token, index) => {
         try {
-          return await sendToFcm(token, title, body, fcmData);
-        } catch {
-          // The notification document is already saved. Keep one failed
-          // device send from turning the whole request into a 500 response.
-          return { ok: false, status: 0, error: 'FCM request failed' };
+          return {
+            ...(await sendToFcm(token, title, body, fcmData)),
+            tokenIndex: index + 1,
+          };
+        } catch (error) {
+          // Never log the registration token or request credentials.
+          return {
+            ok: false,
+            status: 0,
+            errorStatus: 'NETWORK_ERROR',
+            errorCode: error instanceof Error ? error.name.slice(0, 80) : 'FETCH_ERROR',
+            errorMessage: 'The request to the FCM API could not be completed',
+            tokenIndex: index + 1,
+          };
         }
       }),
     );
@@ -568,7 +604,20 @@ export const handler = async (event) => {
     const failed = results.length - sent;
 
     if (failed > 0) {
-      console.error('FCM send failures:', failed, 'of', results.length);
+      const failures = results
+        .filter((item) => !item.ok)
+        .map((item) => ({
+          tokenIndex: item.tokenIndex,
+          httpStatus: item.status,
+          fcmStatus: item.errorStatus || 'UNKNOWN',
+          fcmErrorCode: item.errorCode || '',
+          message: item.errorMessage || 'Unknown FCM error',
+        }));
+      console.error('[FCM] individual send failures:', JSON.stringify({
+        failed,
+        total: results.length,
+        failures,
+      }));
     }
 
     // The in-app notification is already stored; return success to avoid the
