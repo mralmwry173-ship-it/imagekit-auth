@@ -56,6 +56,8 @@ const PARTICIPANT_STATUSES = new Set([
   'completed',
   'returned',
 ]);
+const ADMIN_ROLES = new Set(['super_admin', 'admin_staff']);
+const SUPPORT_ROLES = new Set(['super_admin', 'admin_staff', 'support']);
 
 let serviceAccountCache;
 let accessTokenCache;
@@ -451,6 +453,135 @@ async function sendToFcm(token, title, body, data) {
   return { ok: true };
 }
 
+async function sendComplaintNotification({
+  notificationId,
+  recipientUid,
+  recipientUser,
+  senderUid,
+  title,
+  body,
+  complaintId,
+  event,
+  route,
+}) {
+  const notificationData = {
+    complaintId,
+    event,
+    route: typeof route === 'string' && route.startsWith('/')
+      ? route
+      : '/notifications',
+  };
+
+  const writeResult = await createNotificationDocument(notificationId, {
+    recipientUid,
+    senderUid,
+    title,
+    body,
+    type: 'complaint',
+    data: notificationData,
+    isRead: false,
+    createdAt: new Date(),
+  });
+
+  if (writeResult.duplicate) {
+    return {
+      success: true,
+      duplicate: true,
+      stored: true,
+      sent: 0,
+      failed: 0,
+    };
+  }
+
+  const tokens = extractFcmTokens(recipientUser);
+  if (tokens.length === 0) {
+    return {
+      success: true,
+      stored: true,
+      sent: 0,
+      failed: 0,
+      reason: 'No registered FCM tokens for recipient',
+    };
+  }
+
+  const fcmData = {
+    notificationId,
+    type: 'complaint',
+    complaintId,
+    event,
+    route: notificationData.route,
+  };
+  const results = await Promise.all(
+    tokens.map(async (token, index) => {
+      try {
+        return {
+          ...(await sendToFcm(token, title, body, fcmData)),
+          tokenIndex: index + 1,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          status: 0,
+          errorStatus: 'NETWORK_ERROR',
+          errorCode: error instanceof Error ? error.name.slice(0, 80) : 'FETCH_ERROR',
+          errorMessage: 'The request to the FCM API could not be completed',
+          tokenIndex: index + 1,
+        };
+      }
+    }),
+  );
+
+  const sent = results.filter((item) => item.ok).length;
+  const failed = results.length - sent;
+  const unregisteredTokens = results
+    .filter((item) => !item.ok && item.errorCode === 'UNREGISTERED')
+    .map((item) => tokens[item.tokenIndex - 1])
+    .filter(Boolean);
+
+  let staleTokensRemoved = 0;
+  if (unregisteredTokens.length > 0) {
+    try {
+      staleTokensRemoved = await removeUnregisteredFcmTokens(
+        recipientUid,
+        unregisteredTokens,
+        recipientUser,
+      );
+      console.info('[FCM] removed unregistered device tokens:', staleTokensRemoved);
+    } catch (cleanupError) {
+      console.error(
+        '[FCM] stale-token cleanup failed:',
+        cleanupError instanceof Error ? cleanupError.message : 'unknown error',
+      );
+    }
+  }
+
+  if (failed > 0) {
+    const failures = results
+      .filter((item) => !item.ok)
+      .map((item) => ({
+        tokenIndex: item.tokenIndex,
+        httpStatus: item.status,
+        fcmStatus: item.errorStatus || 'UNKNOWN',
+        fcmErrorCode: item.errorCode || '',
+        message: item.errorMessage || 'Unknown FCM error',
+      }));
+    console.error('[FCM] complaint send failures:', JSON.stringify({
+      failed,
+      total: results.length,
+      staleTokensRemoved,
+      failures,
+    }));
+  }
+
+  return {
+    success: true,
+    stored: true,
+    sent,
+    failed,
+    staleTokensRemoved,
+  };
+}
+
 function safeId(value) {
   return typeof value === 'string' && /^[A-Za-z0-9_-]{1,150}$/.test(value);
 }
@@ -512,10 +643,26 @@ export const handler = async (event) => {
     if (!safeId(notificationId) || !safeId(recipientUid) || !title || !body) {
       return response(400, { error: 'notificationId, recipientUid, title and body are required' }, headers);
     }
-    if (type.length === 0 || !safeId(orderId) || typeof newStatus !== 'string' ||
-        !Object.hasOwn(STATUS_LABELS, newStatus)) {
+    if (type === 'complaint') {
+      if (
+        !safeId(data.complaintId) ||
+        !['created', 'resolved'].includes(safeText(data.event, 32))
+      ) {
+        return response(400, {
+          error: 'Complaint notifications require data.complaintId and event created or resolved',
+        }, headers);
+      }
+    } else if (
+      type !== 'order' && type !== 'payment'
+    ) {
+      return response(400, { error: 'Unsupported notification type' }, headers);
+    } else if (
+      !safeId(orderId) ||
+      typeof newStatus !== 'string' ||
+      !Object.hasOwn(STATUS_LABELS, newStatus)
+    ) {
       return response(400, {
-        error: 'This endpoint currently accepts order notifications with data.orderId and data.newStatus',
+        error: 'Order notifications require data.orderId and a supported data.status',
       }, headers);
     }
 
@@ -528,6 +675,75 @@ export const handler = async (event) => {
     const senderUid = identity.sub;
     if (!safeId(senderUid)) {
       return response(401, { error: 'Invalid authentication token' }, headers);
+    }
+
+    if (type === 'complaint') {
+      const complaintId = data.complaintId;
+      const complaintEvent = safeText(data.event, 32);
+      const [complaint, sender] = await Promise.all([
+        getFirestoreDocument('complaints/' + encodeURIComponent(complaintId)),
+        getFirestoreDocument('users/' + encodeURIComponent(senderUid)),
+      ]);
+
+      if (!complaint) return response(404, { error: 'Complaint not found' }, headers);
+      if (!sender) return response(403, { error: 'User account not found' }, headers);
+
+      const senderRole = safeText(sender.role || identity.role || '', 64).toLowerCase();
+      const complainantUid = safeText(complaint.complainantUid, 128);
+      let allowed = false;
+
+      if (complaintEvent === 'created') {
+        allowed = senderUid === complainantUid && senderRole !== '';
+        if (allowed) {
+          const recipient = await getFirestoreDocument(
+            'users/' + encodeURIComponent(recipientUid),
+          );
+          if (!recipient || !ADMIN_ROLES.has(
+            safeText(recipient.role, 64).toLowerCase(),
+          )) {
+            return response(403, {
+              error: 'New complaint notifications may only target an administrator',
+            }, headers);
+          }
+        }
+      } else if (complaintEvent === 'resolved') {
+        allowed = SUPPORT_ROLES.has(senderRole) &&
+          complaint.status === 'resolved' &&
+          recipientUid === complainantUid;
+      }
+
+      if (!allowed) {
+        return response(403, {
+          error: 'Sender or recipient is not authorized for this complaint event',
+        }, headers);
+      }
+
+      if (recipientUid === senderUid) {
+        return response(200, {
+          success: true,
+          skipped: true,
+          reason: 'Sender does not receive their own notification',
+        }, headers);
+      }
+
+      const recipientUser = await getFirestoreDocument(
+        'users/' + encodeURIComponent(recipientUid),
+      );
+      if (!recipientUser) {
+        return response(404, { error: 'Recipient account not found' }, headers);
+      }
+      const pushResult = await sendComplaintNotification({
+        notificationId: safeText(requestBody.notificationId, 150),
+        recipientUid,
+        recipientUser,
+        senderUid,
+        title,
+        body,
+        complaintId,
+        event: complaintEvent,
+        route: data.route,
+      });
+      return response(200, pushResult, headers);
     }
 
     const [order, sender] = await Promise.all([
