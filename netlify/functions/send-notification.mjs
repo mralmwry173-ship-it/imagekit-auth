@@ -279,6 +279,86 @@ function extractFcmTokens(user) {
   ))].slice(0, 20);
 }
 
+async function removeUnregisteredFcmTokens(recipientUid, staleTokens, recipientUser) {
+  const uniqueTokens = [...new Set(staleTokens.filter(
+    (token) => typeof token === 'string' && token.length > 20,
+  ))];
+  if (uniqueTokens.length === 0) return 0;
+
+  const documentName = 'projects/' + PROJECT_ID +
+    '/databases/(default)/documents/users/' + encodeURIComponent(recipientUid);
+  const transforms = [];
+  const matchedTokens = new Set();
+
+  for (const fieldPath of ['fcmTokens', 'fcmToken']) {
+    const storedValue = recipientUser?.[fieldPath];
+    if (!Array.isArray(storedValue)) continue;
+    const valuesToRemove = uniqueTokens.filter((token) => storedValue.includes(token));
+    if (valuesToRemove.length === 0) continue;
+
+    valuesToRemove.forEach((token) => matchedTokens.add(token));
+    transforms.push({
+      fieldPath,
+      removeAllFromArray: {
+        values: valuesToRemove.map((token) => ({ stringValue: token })),
+      },
+    });
+  }
+
+  if (transforms.length > 0) {
+    const accessToken = await getGoogleAccessToken();
+    const result = await fetch(
+      'https://firestore.googleapis.com/v1/projects/' + PROJECT_ID +
+        '/databases/(default)/documents:commit',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + accessToken,
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({
+          writes: [{
+            transform: {
+              document: documentName,
+              fieldTransforms: transforms,
+            },
+          }],
+        }),
+      },
+    );
+    if (!result.ok) {
+      throw new Error('Firestore stale-token array cleanup failed (' + result.status + ')');
+    }
+  }
+
+  // Older app versions may have stored a single token in fcmToken.
+  if (
+    typeof recipientUser?.fcmToken === 'string' &&
+    uniqueTokens.includes(recipientUser.fcmToken)
+  ) {
+    const accessToken = await getGoogleAccessToken();
+    const url = 'https://firestore.googleapis.com/v1/' + documentName +
+      '?updateMask.fieldPaths=fcmToken';
+    const result = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        Authorization: 'Bearer ' + accessToken,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({
+        name: documentName,
+        fields: { fcmToken: { nullValue: 'NULL_VALUE' } },
+      }),
+    });
+    if (!result.ok) {
+      throw new Error('Firestore legacy-token cleanup failed (' + result.status + ')');
+    }
+    matchedTokens.add(recipientUser.fcmToken);
+  }
+
+  return matchedTokens.size;
+}
+
 function toFcmData(data, notificationId, orderId, status) {
   const result = {
     notificationId,
@@ -603,6 +683,28 @@ export const handler = async (event) => {
     const sent = results.filter((item) => item.ok).length;
     const failed = results.length - sent;
 
+    const unregisteredTokens = results
+      .filter((item) => !item.ok && item.errorCode === 'UNREGISTERED')
+      .map((item) => tokens[item.tokenIndex - 1])
+      .filter(Boolean);
+
+    let staleTokensRemoved = 0;
+    if (unregisteredTokens.length > 0) {
+      try {
+        staleTokensRemoved = await removeUnregisteredFcmTokens(
+          recipientUid,
+          unregisteredTokens,
+          recipientUser,
+        );
+        console.info('[FCM] removed unregistered device tokens:', staleTokensRemoved);
+      } catch (cleanupError) {
+        console.error(
+          '[FCM] stale-token cleanup failed:',
+          cleanupError instanceof Error ? cleanupError.message : 'unknown error',
+        );
+      }
+    }
+
     if (failed > 0) {
       const failures = results
         .filter((item) => !item.ok)
@@ -616,6 +718,7 @@ export const handler = async (event) => {
       console.error('[FCM] individual send failures:', JSON.stringify({
         failed,
         total: results.length,
+        staleTokensRemoved,
         failures,
       }));
     }
