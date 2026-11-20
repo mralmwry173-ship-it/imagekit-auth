@@ -360,7 +360,7 @@ async function sendToFcm(token, title, body, data) {
         ? fcmDetail.errorCode.slice(0, 80)
         : '',
       errorMessage: typeof apiError.message === 'string'
-        ? apiError.message.replace(/\\s+/g, ' ').slice(0, 180)
+        ? apiError.message.replace(/\s+/g, ' ').slice(0, 180)
         : 'FCM request rejected',
     };
   }
