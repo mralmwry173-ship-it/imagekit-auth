@@ -13,6 +13,8 @@ const STATUS_LABELS = {
   paid: 'تم تأكيد الدفع',
   confirmed: 'تم تأكيد الطلب',
   preparing: 'جارٍ تجهيز الطلب',
+  processing: 'جارٍ تجهيز الطلب',
+  shipped: 'تم شحن الطلب',
   ready_for_pickup: 'الطلب جاهز للاستلام',
   delivery_searching: 'جارٍ البحث عن مندوب توصيل',
   assigned_to_agent: 'تم تعيين مندوب للطلب',
@@ -31,6 +33,8 @@ const MERCHANT_STATUSES = new Set([
   'paid',
   'confirmed',
   'preparing',
+  'processing',
+  'shipped',
   'ready_for_pickup',
   'delivery_searching',
   'rejected',
@@ -567,7 +571,10 @@ export const handler = async (event) => {
     if (!isAdmin && MERCHANT_STATUSES.has(newStatus) && !isMerchant) {
       return response(403, { error: 'Only the store owner or an administrator can notify this status' }, headers);
     }
-    if (!isAdmin && AGENT_STATUSES.has(newStatus) && !isAgent) {
+    const isMerchantLegacyDeliveryCompletion =
+      newStatus === 'delivered' && isMerchant;
+    if (!isAdmin && AGENT_STATUSES.has(newStatus) &&
+        !isAgent && !isMerchantLegacyDeliveryCompletion) {
       return response(403, { error: 'Only the assigned delivery agent or an administrator can notify this status' }, headers);
     }
     if (!isAdmin && CUSTOMER_STATUSES.has(newStatus) && !isCustomer) {
